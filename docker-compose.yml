@@ -1,0 +1,148 @@
+name: portfolio
+x-safe: &safe
+  restart: unless-stopped
+  security_opt: [no-new-privileges:true]
+  logging:
+    driver: json-file
+    options: {max-size: 10m, max-file: '3'}
+services:
+  mysql:
+    <<: *safe
+    image: mysql:8.4
+    environment:
+      MYSQL_DATABASE: portfolio
+      MYSQL_USER: portfolio
+      MYSQL_PASSWORD_FILE: /run/secrets/db_password
+      MYSQL_ROOT_PASSWORD_FILE: /run/secrets/root_password
+    secrets: [db_password, root_password]
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./secrets/init-exporter.sql:/docker-entrypoint-initdb.d/01-exporter.sql:ro
+    networks: [data]
+    healthcheck:
+      test: [CMD-SHELL, 'MYSQL_PWD=$$(cat /run/secrets/db_password) mysql -h 127.0.0.1 -u portfolio portfolio -e "SELECT 1"']
+      interval: 10s
+      timeout: 5s
+      retries: 30
+  app:
+    <<: *safe
+    build: ./app
+    image: portfolio-app:local
+    secrets: [db_password]
+    volumes: [app_logs:/logs/app]
+    tmpfs: [/tmp]
+    read_only: true
+    cap_drop: [ALL]
+    networks: [edge, data]
+    depends_on:
+      mysql: {condition: service_healthy}
+      init: {condition: service_completed_successfully}
+    healthcheck:
+      test: [CMD, php, -r, "exit(@file_get_contents('http://127.0.0.1:8080/health')===false?1:0);"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+  init:
+    image: portfolio-app:local
+    build: ./app
+    user: '0:0'
+    command: [sh, -c, 'mkdir -p /logs/app && chown 10001:10001 /logs/app && php /app/bootstrap.php']
+    secrets: [db_password, admin_password]
+    volumes: [app_logs:/logs/app]
+    networks: [data]
+    depends_on:
+      mysql: {condition: service_healthy}
+    security_opt: [no-new-privileges:true]
+  nginx:
+    <<: *safe
+    image: portfolio-nginx:local
+    build: ./nginx
+    ports: ['${WEB_PORT:-8088}:8080']
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+      - nginx_logs:/var/log/portfolio
+    tmpfs: [/tmp]
+    read_only: true
+    cap_drop: [ALL]
+    networks: [edge, monitoring]
+    depends_on:
+      app: {condition: service_healthy}
+  phpmyadmin:
+    <<: *safe
+    image: phpmyadmin:5.2-apache
+    ports: ['127.0.0.1:${DB_TOOL_PORT:-8089}:80']
+    environment: {PMA_HOST: mysql, PMA_ARBITRARY: '0', UPLOAD_LIMIT: 16M}
+    networks: [data, tools]
+    depends_on:
+      mysql: {condition: service_healthy}
+  nginx-exporter:
+    <<: *safe
+    image: nginx/nginx-prometheus-exporter:1.4.2
+    command: ['--nginx.scrape-uri=http://nginx:8081/stub_status']
+    networks: [monitoring]
+  mysql-exporter:
+    <<: *safe
+    image: prom/mysqld-exporter:v0.17.2
+    command: ['--config.my-cnf=/run/secrets/exporter.cnf']
+    secrets: [exporter.cnf]
+    networks: [data, monitoring]
+    depends_on:
+      mysql: {condition: service_healthy}
+  prometheus:
+    <<: *safe
+    image: prom/prometheus:v3.2.1
+    ports: ['127.0.0.1:${PROMETHEUS_PORT:-9098}:9090']
+    volumes: ['./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro', 'prometheus_data:/prometheus']
+    networks: [monitoring, tools]
+  grafana:
+    <<: *safe
+    image: grafana/grafana:11.6.0
+    ports: ['127.0.0.1:${GRAFANA_PORT:-3008}:3000']
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_password
+      GF_USERS_ALLOW_SIGN_UP: 'false'
+    secrets: [grafana_password]
+    volumes: ['grafana_data:/var/lib/grafana', './grafana/provisioning:/etc/grafana/provisioning:ro', './grafana/dashboards:/var/lib/grafana/dashboards:ro']
+    networks: [monitoring, tools]
+  loki:
+    <<: *safe
+    image: grafana/loki:3.4.2
+    command: ['-config.file=/etc/loki/config.yml']
+    volumes: ['./loki/config.yml:/etc/loki/config.yml:ro', 'loki_data:/loki']
+    networks: [monitoring]
+  promtail:
+    <<: *safe
+    image: grafana/promtail:3.4.2
+    command: ['-config.file=/etc/promtail/config.yml']
+    volumes:
+      - ./promtail/config.yml:/etc/promtail/config.yml:ro
+      - app_logs:/logs/app:ro
+      - nginx_logs:/logs/nginx:ro
+      - promtail_data:/positions
+    networks: [monitoring]
+  cadvisor:
+    <<: *safe
+    image: ghcr.io/google/cadvisor:0.55.1
+    profiles: [linux-monitoring]
+    volumes: ['/:/rootfs:ro', '/var/run:/var/run:ro', '/sys:/sys:ro', '/var/lib/docker:/var/lib/docker:ro', '/dev/disk:/dev/disk:ro']
+    networks: [monitoring]
+networks:
+  edge: {}
+  tools: {}
+  data: {internal: true}
+  monitoring: {internal: true}
+volumes:
+  mysql_data: {}
+  app_logs: {}
+  nginx_logs: {}
+  prometheus_data: {}
+  grafana_data: {}
+  loki_data: {}
+  promtail_data: {}
+secrets:
+  db_password: {file: ./secrets/db_password}
+  root_password: {file: ./secrets/root_password}
+  admin_password: {file: ./secrets/admin_password}
+  grafana_password: {file: ./secrets/grafana_password}
+  exporter.cnf: {file: ./secrets/exporter.cnf}
